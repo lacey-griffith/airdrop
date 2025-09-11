@@ -1,0 +1,45 @@
+name: AirDrop — Post QA Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "ClickUp task URL or ID (e.g., https://app.clickup.com/t/abc123 or abc123)"
+        required: true
+        type: string
+
+# Prevent duplicate runs for the same task if someone clicks twice
+concurrency:
+  group: airdrop-${{ github.workflow }}-${{ inputs.task }}
+  cancel-in-progress: false
+
+# This workflow only needs read access to the repo contents
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: Post QA comment
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run AirDrop script
+        run: node post-qa.js "${{ inputs.task }}"
+        env:
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+        #   MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+        #   MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+        #   MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
