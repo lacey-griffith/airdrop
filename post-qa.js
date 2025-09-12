@@ -6,7 +6,7 @@
  *   2) Reads the "QA Doc" custom field (SharePoint folder URL)
  *   3) Finds the Excel named like the ClickUp task title, extracts preview links
  *   4) Downloads images from the folder and re-uploads them to the ClickUp task
- *   5) Posts a formatted comment with the links + images (+ optional @mentions)
+ *   5) Posts a DRAFT comment with the links + images (no notifications)
  *
  * Usage:
  *   node post-qa.js <ClickUp task URL or ID>
@@ -23,26 +23,27 @@
 // =========================
 const CONFIG = {
   clickup: {
-    requiredStatus: "needs approval (dev)", // gate: must match (case-insensitive)
+    // Use the human label shown in your UI; we normalize for comparison.
+    requiredStatus: "Needs Approval (Dev)",
+
     fieldNames: {
-      passedQA: "Passed QA", // checkbox
-      qaDocUrl: "QA Doc", // SharePoint folder URL
-      clientMentions: "Client Mentions", // optional, comma-separated names
+      passedQA: "Passed QA",  // checkbox
+      qaDocUrl: "QA Doc",     // SharePoint folder URL (folder that contains images + Excel)
+      clientMentions: "Client Mentions", // optional, comma-separated names mapped via mentionMap
     },
-    // Friendly name → ClickUp userId (add later when you create the field)
+
+    // Friendly name → ClickUp userId (only used if you later enable mentions in FINAL mode)
     mentionMap: {
       // "Acme PM": "12345678"
     },
   },
+
   notifications: {
-    postGateFailureComment: true, // posts a comment when gates fail
+    postGateFailureComment: true, // post a failure comment when gates aren't met
   },
+
   sharepoint: {
-    // Excel selection policy:
-    //   1) exact "<taskTitle>.xlsx|xls"
-    //   2) startsWith "<taskTitle> " (e.g., " - v2.xlsx")
-    //   3) filename contains "preview"
-    //   4) any .xlsx as last resort
+    // Excel selection policy is implemented in sharepoint.js (findExcelForTask)
     imageExtensions: /\.(png|jpe?g|webp|gif)$/i,
   },
 
@@ -54,26 +55,26 @@ const CONFIG = {
 
   // Attachments already on the task (fallback if SharePoint images aren’t accessible)
   taskAttachmentFilter: {
-    restrictToQAishNames: false, // set true to only include filenames containing "qa"
+    restrictToQAishNames: false,                    // true → only include names containing "qa"
     qaNamePattern: /(^|\/|_|-|\s)qa($|\.|\s|_|-)/i, // only used if restrictToQAishNames = true
   },
 
-  // Toggle logging verbosity
+  // Logging
   logging: { verbose: true },
 
-  // Always create a draft (no notifications). Flip to 'final' only if you ever want to notify.
+  // Always create a draft (no notifications). You will manually send a client-ready message after review.
   commentMode: "draft", // 'draft' | 'final'
 
   draft: {
     addBanner: true,
     bannerText: "📝 DRAFT — Review before sending",
-    notifyAll: false, // do NOT ping watchers on draft
-    saveToTextField: null, // <- DISABLED: do not write to any Text CF
+    notifyAll: false,       // do NOT ping watchers on draft
+    saveToTextField: null,  // disabled by request: do not write to any Text CF
   },
 
   final: {
-    notifyAll: true, // ping watchers on final
-    includeMentions: true, // mentions only in final
+    notifyAll: true,        // notify watchers (only used if you ever switch to 'final')
+    includeMentions: true,  // include @mentions (only in 'final')
   },
 };
 // =========================
@@ -93,6 +94,27 @@ import {
 } from "./sharepoint.js";
 
 // -------------------------
+// Small utils
+// -------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const normalize = (s = "") =>
+  String(s)
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s]/g, "")
+    .trim();
+
+function parseTaskId(input) {
+  const m = String(input).match(/\/t\/([^/?#]+)/i);
+  return m ? m[1] : String(input);
+}
+
+function log(...args) {
+  if (CONFIG.logging.verbose) console.log(...args);
+}
+
+// -------------------------
 // ClickUp REST helpers
 // -------------------------
 const CLICKUP_API = "https://api.clickup.com/api/v2";
@@ -101,10 +123,6 @@ const CLICKUP_TOKEN = process.env.CLICKUP_TOKEN;
 if (!CLICKUP_TOKEN) {
   console.error("Missing CLICKUP_TOKEN env. Add it to repo Secrets or .env");
   process.exit(1);
-}
-
-function log(...args) {
-  if (CONFIG.logging.verbose) console.log(...args);
 }
 
 async function cuGet(path) {
@@ -150,20 +168,6 @@ async function cuUploadAttachment(taskId, filename, buffer) {
 // -------------------------
 // ClickUp task helpers
 // -------------------------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-const normalize = (s = "") =>
-  String(s)
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .replace(/[^\w\s]/g, "")
-    .trim();
-
-function parseTaskId(input) {
-  const m = String(input).match(/\/t\/([^/?#]+)/i);
-  return m ? m[1] : String(input);
-}
-
 function getCustomField(task, fieldName) {
   return (
     (task.custom_fields || []).find(
@@ -172,11 +176,10 @@ function getCustomField(task, fieldName) {
   );
 }
 
+/** Find a custom field by ID or name (case-insensitive) */
 function findCustomField(task, target) {
   const list = task?.custom_fields || [];
-  const needle = String(target || "")
-    .trim()
-    .toLowerCase();
+  const needle = String(target || "").trim().toLowerCase();
   return list.find(
     (cf) =>
       (cf.id && String(cf.id).toLowerCase() === needle) ||
@@ -184,14 +187,13 @@ function findCustomField(task, target) {
   );
 }
 
+/** ClickUp checkboxes can be true/false, 1/0, and string encodings */
 function isCheckboxChecked(cfObj) {
   const v = cfObj?.value;
   if (v === true || v === 1) return true;
   if (typeof v === "string") {
     const s = v.trim().toLowerCase();
-    return (
-      s === "true" || s === "1" || s === "yes" || s === "checked" || s === "on"
-    );
+    return s === "true" || s === "1" || s === "yes" || s === "checked" || s === "on";
   }
   return false;
 }
@@ -246,10 +248,10 @@ function formatMentions(userIds) {
   return userIds.map((id) => `<@${id}>`).join(" ");
 }
 
+/** Build the comment. Mentions are included only if explicitly allowed. */
 function buildComment({ taskName, previewLinks, images, mentionIds, includeMentions }) {
   const lines = [];
 
-  // only include mentions when explicitly allowed (e.g., final mode)
   if (includeMentions && mentionIds?.length) {
     lines.push(`${formatMentions(mentionIds)}\n`);
   }
@@ -257,23 +259,22 @@ function buildComment({ taskName, previewLinks, images, mentionIds, includeMenti
   lines.push(`**QA Passed → Preview Links for _${taskName}_**\n`);
 
   if (previewLinks.length) {
-    lines.push('**Preview Links**');
+    lines.push("**Preview Links**");
     previewLinks.forEach((url, i) => lines.push(`- [Link ${i + 1}](${url})`));
-    lines.push('');
+    lines.push("");
   } else {
-    lines.push('_No preview links found._\n');
+    lines.push("_No preview links found._\n");
   }
 
   if (images.length) {
-    lines.push('**QA Images**');
-    images.forEach((img) => lines.push(`- ${img.name || 'image'} → ${img.url}`));
+    lines.push("**QA Images**");
+    images.forEach((img) => lines.push(`- ${img.name || "image"} → ${img.url}`));
   } else {
-    lines.push('_No QA images found._');
+    lines.push("_No QA images found._");
   }
 
-  return lines.join('\n');
+  return lines.join("\n");
 }
-
 
 // -------------------------
 // Main
@@ -287,50 +288,58 @@ const TASK_ID = parseTaskId(INPUT);
 
 (async function run() {
   try {
-    // 1) Load task + validate gate
+    console.log("[AirDrop] Start", {
+      taskId: TASK_ID,
+      mode: CONFIG.commentMode,
+      requiredStatus: CONFIG.clickup.requiredStatus,
+    });
+
+    // 1) Load task + validate gates
     const task = await cuGet(`/task/${TASK_ID}`);
     const taskName = task.name || TASK_ID;
 
-    // Status
-    const requiredStatus = CONFIG.clickup.requiredStatus; // e.g., "needs approval (dev)"
-    let statusNow =
-      (task.status && (task.status.status || task.status.name)) || "";
-    let statusOk = normalize(statusNow) === normalize(requiredStatus);
+    log("[AirDrop] Task basics", {
+      name: taskName,
+      statusRaw: task?.status?.status || task?.status?.name || "",
+    });
+
+    // Status (robust normalization on both sides)
+    const requiredStatus = CONFIG.clickup.requiredStatus;
+    const requiredStatusNorm = normalize(requiredStatus);
+
+    let statusNow = (task.status && (task.status.status || task.status.name)) || "";
+    let statusNowNorm = normalize(statusNow);
+
+    let statusOk = statusNowNorm === requiredStatusNorm;
 
     // Passed QA
-    const passedFieldNameOrId = CONFIG.clickup.fieldNames.passedQA; // e.g., "Passed QA"
+    const passedFieldNameOrId = CONFIG.clickup.fieldNames.passedQA;
     const cfPassed = findCustomField(task, passedFieldNameOrId);
     let passedQA = isCheckboxChecked(cfPassed);
 
-    if (CONFIG.logging?.verbose) {
-      console.log("[AirDrop] Gate check:", {
-        requiredStatus,
-        statusNow,
-        statusOk,
-        passedField: cfPassed
-          ? {
-              id: cfPassed.id,
-              name: cfPassed.name,
-              type: cfPassed.type,
-              raw: cfPassed.value,
-            }
-          : null,
-        passedQA,
-      });
-    }
+    log("[AirDrop] Gates", {
+      requiredStatus,
+      requiredStatusNorm,
+      statusNow,
+      statusNowNorm,
+      statusOk,
+      passedField: cfPassed
+        ? { id: cfPassed.id, name: cfPassed.name, type: cfPassed.type, raw: cfPassed.value }
+        : null,
+      passedQA,
+    });
 
-    // Safety-net: if status is still QA(Dev) but Passed QA is true, wait once and re-check
-    if (!statusOk && passedQA && /^qa(?:\s*\(dev\))?$/i.test(statusNow)) {
-      console.log(
-        "[AirDrop] Status still QA but Passed QA is true; waiting 1.5s for automation to land…"
-      );
+    // Safety-net: if status is still QA (or QA Dev) but Passed QA is true, wait once and re-check
+    const qaNorm = normalize("QA");
+    const qaDevNorm = normalize("QA (Dev)");
+    if (!statusOk && passedQA && (statusNowNorm === qaNorm || statusNowNorm === qaDevNorm)) {
+      console.log("[AirDrop] Status still QA while Passed QA is true; waiting 1.5s for automation to land…");
       await sleep(1500);
       const t2 = await cuGet(`/task/${TASK_ID}`);
       statusNow = (t2.status && (t2.status.status || t2.status.name)) || "";
-      statusOk = normalize(statusNow) === normalize(requiredStatus);
-      if (CONFIG.logging?.verbose) {
-        console.log("[AirDrop] Re-check after wait:", { statusNow, statusOk });
-      }
+      statusNowNorm = normalize(statusNow);
+      statusOk = statusNowNorm === requiredStatusNorm;
+      log("[AirDrop] Re-check after wait", { statusNow, statusNowNorm, statusOk });
     }
 
     // Final decision
@@ -343,42 +352,26 @@ const TASK_ID = parseTaskId(INPUT);
           await cuPost(`/task/${TASK_ID}/comment`, { comment_text: failMsg });
           console.log("[AirDrop] Posted gate-failure comment.");
         } catch (e) {
-          console.warn(
-            "[AirDrop] Could not post failure comment:",
-            e?.message || e
-          );
+          console.warn("[AirDrop] Could not post failure comment:", e?.message || e);
         }
       }
       return; // stop early
     }
 
-    // // 🔔 If gates fail, optionally post a human-friendly comment on the task and exit
-    // if (!statusOk || !passedQA) {
-    //   console.log("AirDrop gate failed; not posting.");
-
-    //   if (CONFIG.notifications.postGateFailureComment) {
-    //     const failMsg = `🪂 AirDrop Status: Fail. Status must be [Needs Approval (Dev)] and Passed QA must be checked. Current Status: [${
-    //       statusName || "Unknown"
-    //     }].`;
-    //     try {
-    //       await cuPost(`/task/${TASK_ID}/comment`, { comment_text: failMsg });
-    //       console.log("Posted AirDrop failure status comment.");
-    //     } catch (e) {
-    //       console.warn("Could not post failure comment:", e.message || e);
-    //     }
-    //   }
-
-    //   process.exit(0);
-    // }
-
     // 2) Resolve SharePoint folder URL from "QA Doc"
-    const cfDoc = getCustomField(task, CONFIG.clickup.fieldNames.qaDocUrl);
+    // Use findCustomField (case-insensitive / id or name)
+    const cfDoc = findCustomField(task, CONFIG.clickup.fieldNames.qaDocUrl);
     const qaFolderUrl = getTextFieldValue(cfDoc);
+
+    log("[AirDrop] QA Doc field", {
+      fieldFound: !!cfDoc,
+      fieldId: cfDoc?.id || null,
+      qaFolderUrl: qaFolderUrl || "(none)",
+    });
+
     if (!qaFolderUrl) {
-      console.log(
-        `⛔ No "${CONFIG.clickup.fieldNames.qaDocUrl}" URL present on task. Nothing to do.`
-      );
-      process.exit(0);
+      console.log(`⛔ No "${CONFIG.clickup.fieldNames.qaDocUrl}" URL present on task. Nothing to do.`);
+      return;
     }
 
     // 3) List folder items via Graph (preferred)
@@ -386,32 +379,34 @@ const TASK_ID = parseTaskId(INPUT);
     let previewLinks = [];
     let uploadedImages = [];
 
+    log("[AirDrop] Graph token present:", !!graphToken);
+
     if (graphToken) {
       try {
-        const items = await listFolderItems({
-          folderUrl: qaFolderUrl,
-          token: graphToken,
-        });
+        const items = await listFolderItems({ folderUrl: qaFolderUrl, token: graphToken });
+        log("[AirDrop] Folder items:", Array.isArray(items) ? items.length : "(none)");
+        if (Array.isArray(items) && items.length) {
+          log("[AirDrop] First few item names:", items.slice(0, 5).map((i) => i.name));
+        }
 
         // 3a) Excel selection (based on task title), then extract links
         const excelItem = findExcelForTask(items, taskName);
         if (excelItem) {
-          log(`Excel selected: ${excelItem.name}`);
+          log("[AirDrop] Excel chosen:", { name: excelItem.name, id: excelItem.id });
           const buf = await downloadItemBuffer({
             driveId: excelItem.driveId,
             itemId: excelItem.id,
             token: graphToken,
           });
           previewLinks = extractPreviewLinksFromXlsx(buf);
+          log("[AirDrop] Preview links from Excel:", previewLinks.length);
+          if (previewLinks.length) log("[AirDrop] Sample link:", previewLinks[0]);
         } else {
-          log("No Excel found in folder.");
+          log("[AirDrop] No Excel found in folder.");
         }
 
         // 3b) Images: download from SharePoint → re-upload to ClickUp
-        const imageItems = getImageFiles(
-          items,
-          CONFIG.sharepoint.imageExtensions
-        );
+        const imageItems = getImageFiles(items, CONFIG.sharepoint.imageExtensions);
         for (const img of imageItems) {
           const buf = await downloadItemBuffer({
             driveId: img.driveId,
@@ -421,63 +416,64 @@ const TASK_ID = parseTaskId(INPUT);
           const uploaded = await cuUploadAttachment(TASK_ID, img.name, buf);
           const uploadedUrl = uploaded?.data?.url || uploaded?.url || "";
           uploadedImages.push({ name: img.name, url: uploadedUrl });
+          log("[AirDrop] Uploaded image", { name: img.name, uploadedUrl });
         }
       } catch (err) {
         console.warn("SharePoint parse warning:", err.message || err);
       }
     } else {
-      console.warn(
-        "No Graph token available. Skipping SharePoint folder read (private folders require MS_* secrets)."
-      );
+      console.warn("No Graph token available. Skipping SharePoint folder read (private folders require MS_* secrets).");
     }
 
-    // 4) Fallbacks if Excel or Graph was unavailable
+    // 4) Fallbacks if Excel/Graph unavailable
     if (!previewLinks.length) {
-      // Try task description for preview URLs (safety net)
+      log("[AirDrop] No Excel links; trying description…");
       const descUrls = extractUrlsFromText(task.description || "");
       previewLinks = extractPreviewLinksFromText(descUrls.join("\n"));
     }
+    log("[AirDrop] Preview links (final set):", previewLinks.length);
 
     const taskAttachments = selectTaskImageAttachments(task).map((a) => ({
       name: a.title || a.name || "image",
       url: a.url,
     }));
-
-    const finalImages = uploadedImages.length
-      ? uploadedImages
-      : taskAttachments;
+    const finalImages = uploadedImages.length ? uploadedImages : taskAttachments;
 
     // 5) Mentions (optional)
     const mentionIds = resolveMentionIdsFromTask(task);
 
-// 6) Build + post (always as DRAFT preview)
-const isDraft = CONFIG.commentMode === 'draft';
-const includeMentions = !isDraft && CONFIG.final.includeMentions;
+    // 6) Build + post (always as DRAFT preview)
+    const isDraft = CONFIG.commentMode === "draft";
+    const includeMentions = !isDraft && CONFIG.final.includeMentions;
+    const uniqueLinks = Array.from(new Set(previewLinks));
 
-const uniqueLinks = Array.from(new Set(previewLinks));
-let commentText = buildComment({
-  taskName,
-  previewLinks: uniqueLinks,
-  images: finalImages,
-  mentionIds,
-  includeMentions,
-});
+    let commentText = buildComment({
+      taskName,
+      previewLinks: uniqueLinks,
+      images: finalImages,
+      mentionIds,
+      includeMentions,
+    });
 
-// Add a banner in draft mode so it's obvious to reviewers
-if (isDraft && CONFIG.draft.addBanner) {
-  commentText = `${CONFIG.draft.bannerText}\n\n${commentText}`;
-}
+    if (isDraft && CONFIG.draft.addBanner) {
+      commentText = `${CONFIG.draft.bannerText}\n\n${commentText}`;
+    }
 
-// Post the DRAFT (no notifications)
-await cuPost(`/task/${TASK_ID}/comment`, {
-  comment_text: commentText,
-  notify_all: isDraft ? CONFIG.draft.notifyAll : CONFIG.final.notifyAll,
-});
+    log("[AirDrop] Posting comment (draft mode)", {
+      notify: isDraft ? CONFIG.draft.notifyAll : CONFIG.final.notifyAll,
+      links: uniqueLinks.length,
+      images: finalImages.length,
+    });
 
-console.log(`✅ Posted ${isDraft ? 'DRAFT' : 'FINAL'} QA preview comment to ClickUp.`);
+    await cuPost(`/task/${TASK_ID}/comment`, {
+      comment_text: commentText,
+      notify_all: isDraft ? CONFIG.draft.notifyAll : CONFIG.final.notifyAll,
+    });
 
+    console.log(`✅ Posted ${isDraft ? "DRAFT" : "FINAL"} QA preview comment to ClickUp.`);
   } catch (err) {
-    console.error("Error:", err.message || err);
+    console.error("Error:", err?.message || err);
+    if (err?.stack) console.error(err.stack);
     process.exit(1);
   }
 })();
