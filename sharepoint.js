@@ -1,158 +1,232 @@
-/**
- * sharepoint.js
- * -----------------------------------------------------------------------------
- * Microsoft Graph helpers for SharePoint folder listing + file download,
- * and Excel parsing for Convert preview links.
- *
- * Requires application permissions:
- *   - Files.Read.All
- *   - Sites.Read.All
- * with admin consent on your App Registration.
- */
+// sharepoint.js
+// ----------------------------------------------------------------------------
+// Microsoft Graph helpers for reading a SharePoint folder, optionally drilling
+// into a single child subfolder named like the ClickUp task. Also extracts
+// preview links from an .xlsx and filters image files.
+//
+// Dependencies (already in your package.json):
+//   "node-fetch": "^3", "xlsx": "^0.18"
+//
+// Environment (for private sites):
+//   MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET
+//
+// Exports:
+//   getGraphToken()
+//   listFolderItems({ folderUrl, token })
+//   listFolderChildren({ driveId, itemId, token })
+//   findTaskSubfolder(items, taskTitle)
+//   findExcelForTask(items, taskTitle)
+//   getImageFiles(items, imageRegex)
+//   downloadItemBuffer({ driveId, itemId, token })
+//   extractPreviewLinksFromXlsx(buffer)
 
 import fetch from 'node-fetch';
 import * as XLSX from 'xlsx';
 
-const GRAPH_BASE = 'https://graph.microsoft.com/v1.0';
+// -----------------------------
+// Small utils
+// -----------------------------
+const normalize = (s = '') =>
+  String(s).toLowerCase().replace(/\s+/g, ' ').replace(/[^\w\s]/g, '').trim();
 
-// Per docs: /shares/{encodedUrl} where encoded = base64(url) with URL-safe chars
-function encodeSharingUrl(url) {
-  const b64 = Buffer.from(url, 'utf8')
-    .toString('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
+const isFile = (it) => !!it?.file;
+const isFolder = (it) => !!it?.folder;
+
+function urlToGraphShareId(url) {
+  // Graph expects the URL-safe base64 of the full URL, prefixed with "u!"
+  // Replace '+' -> '-', '/' -> '_', strip '='
+  const b64 = Buffer.from(String(url)).toString('base64')
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
   return `u!${b64}`;
 }
 
-// OAuth2 Client Credentials → access token for Graph
+// -----------------------------
+// Auth
+// -----------------------------
 export async function getGraphToken() {
-  const { MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET } = process.env;
-  if (!MS_TENANT_ID || !MS_CLIENT_ID || !MS_CLIENT_SECRET) return null;
+  const tenant = process.env.MS_TENANT_ID;
+  const client = process.env.MS_CLIENT_ID;
+  const secret = process.env.MS_CLIENT_SECRET;
+  if (!tenant || !client || !secret) return null;
 
-  const url = `https://login.microsoftonline.com/${MS_TENANT_ID}/oauth2/v2.0/token`;
+  const url = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
   const body = new URLSearchParams({
-    client_id: MS_CLIENT_ID,
-    client_secret: MS_CLIENT_SECRET,
-    grant_type: 'client_credentials',
+    client_id: client,
+    client_secret: secret,
     scope: 'https://graph.microsoft.com/.default',
+    grant_type: 'client_credentials',
   });
 
   const res = await fetch(url, { method: 'POST', body });
-  if (!res.ok) return null;
-
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Graph token failed: ${res.status} ${txt}`);
+  }
   const json = await res.json();
-  return json.access_token || null;
+  return json.access_token;
 }
 
-/**
- * List children in a shared folder link.
- * Normalizes a subset of fields we care about.
- * Includes driveId so we can download with /drives/{driveId}/items/{id}/content
- */
-export async function listFolderItems({ folderUrl, token }) {
-  if (!token) return [];
-
-  const encoded = encodeSharingUrl(folderUrl);
-  const res = await fetch(`${GRAPH_BASE}/shares/${encoded}/driveItem/children?$top=999`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Graph list failed: ${res.status}`);
-
+// -----------------------------
+// Folder → driveItem helpers
+// -----------------------------
+async function getDriveItemFromFolderUrl(folderUrl, token) {
+  // Robust way: /shares/{shareId}/driveItem
+  const shareId = urlToGraphShareId(folderUrl);
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/shares/${shareId}/driveItem`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`shares/driveItem failed: ${res.status} ${txt}`);
+  }
   const json = await res.json();
-  const items = (json.value || []).map((it) => ({
-    id: it.id,
-    driveId: it.parentReference?.driveId || '',
-    name: it.name,
-    size: it.size,
-    mime: it.file?.mimeType || '',
-    webUrl: it.webUrl,
-    isFolder: !!it.folder,
+  // json has .parentReference.driveId and .id
+  return json;
+}
+
+export async function listFolderItems({ folderUrl, token }) {
+  const di = await getDriveItemFromFolderUrl(folderUrl, token);
+  const driveId = di?.parentReference?.driveId || di?.parentReference?.id;
+  const itemId = di?.id;
+  if (!driveId || !itemId) throw new Error('Could not resolve driveId/itemId from folder URL');
+
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/children?$top=999`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`children list failed: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  // Normalize items to include driveId for later calls
+  const items = (json.value || []).map(i => ({
+    ...i,
+    driveId,
   }));
   return items;
 }
 
-/**
- * Download a file's bytes using the driveId + itemId form.
- * (Works for application-permission scenarios across sites/drives.)
- */
-export async function downloadItemBuffer({ driveId, itemId, token }) {
-  if (!token) return null;
-  if (!driveId || !itemId) throw new Error('downloadItemBuffer missing driveId or itemId');
-
-  const res = await fetch(`${GRAPH_BASE}/drives/${driveId}/items/${itemId}/content`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!res.ok) throw new Error(`Graph download failed: ${res.status}`);
-
-  const buf = Buffer.from(await res.arrayBuffer());
-  return buf;
+export async function listFolderChildren({ driveId, itemId, token }) {
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/children?$top=999`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`children list failed: ${res.status} ${txt}`);
+  }
+  const json = await res.json();
+  return (json.value || []).map(i => ({ ...i, driveId }));
 }
 
-/**
- * Excel selection strategy based on the ClickUp task's title.
- * Order:
- *   1) exact "<taskTitle>.xlsx|xls"
- *   2) startsWith "<taskTitle> "
- *   3) contains "preview"
- *   4) any .xlsx (fallback)
- */
+// -----------------------------
+// Selection helpers
+// -----------------------------
+export function findTaskSubfolder(items, taskTitle) {
+  // Look for a single child folder that best matches the task title
+  const want = normalize(taskTitle);
+  const folders = items.filter(isFolder);
+
+  // 1) exact normalized match
+  let hit = folders.find(f => normalize(f.name) === want);
+  if (hit) return hit;
+
+  // 2) startsWith (common pattern: "<Task Title> - v2")
+  hit = folders.find(f => normalize(f.name).startsWith(`${want} `));
+  if (hit) return hit;
+
+  // 3) contains (as last resort)
+  return folders.find(f => normalize(f.name).includes(want)) || null;
+}
+
 export function findExcelForTask(items, taskTitle) {
-  const isExcel = (n = '') => /\.xlsx?$/i.test(n);
+  const want = normalize(taskTitle);
 
-  const norm = (s = '') =>
-    s
-      .toLowerCase()
-      .replace(/[\u2013\u2014]/g, '-') // en/em dash → hyphen
-      .replace(/[_\s]+/g, ' ')         // collapse underscores/whitespace
-      .replace(/[^\w.\- ]+/g, '')      // keep letters/numbers/._-
-      .trim();
-
-  const base = norm(taskTitle);
-
-  // exact match
-  const exact = items.find(
-    (f) => !f.isFolder && isExcel(f.name) && norm(f.name).replace(/\.xlsx?$/, '') === base,
+  const excels = items.filter(it =>
+    isFile(it) &&
+    /\.xlsx?$/i.test(it.name || '')
   );
-  if (exact) return exact;
 
-  // starts with "<title> "
-  const starts = items.find(
-    (f) => !f.isFolder && isExcel(f.name) && norm(f.name).startsWith(base + ' '),
-  );
-  if (starts) return starts;
+  if (!excels.length) return null;
 
-  // contains "preview"
-  const preview = items.find((f) => !f.isFolder && isExcel(f.name) && /preview/i.test(f.name));
-  if (preview) return preview;
+  // Strip extension helper
+  const base = (n) => normalize(n.replace(/\.(xlsx?|XLSX?)$/, ''));
 
-  // any excel
-  return items.find((f) => !f.isFolder && isExcel(f.name)) || null;
+  // 1) exact match "<Task Title>.xlsx"
+  let hit = excels.find(f => base(f.name) === want);
+  if (hit) return hit;
+
+  // 2) startsWith "<Task Title> "
+  hit = excels.find(f => base(f.name).startsWith(`${want} `));
+  if (hit) return hit;
+
+  // 3) filename contains "preview"
+  hit = excels.find(f => /preview/i.test(f.name));
+  if (hit) return hit;
+
+  // 4) first xlsx as last resort
+  return excels[0];
 }
 
-/**
- * Return image items in the folder (png/jpg/webp/gif).
- * Accepts a custom extension regex.
- */
-export function getImageFiles(items, extRegex = /\.(png|jpe?g|webp|gif)$/i) {
-  return items.filter((f) => !f.isFolder && extRegex.test(f.name || ''));
+export function getImageFiles(items, imageRegex = /\.(png|jpe?g|webp|gif)$/i) {
+  return items.filter(
+    (it) =>
+      isFile(it) &&
+      (imageRegex.test(it.name || '') ||
+        String(it?.file?.mimeType || '').toLowerCase().startsWith('image/'))
+  );
 }
 
-/**
- * Extract Convert preview URLs from all cells in all sheets (pattern-based).
- * We flatten to CSV per sheet for a quick text scan.
- */
+// -----------------------------
+// Download
+// -----------------------------
+export async function downloadItemBuffer({ driveId, itemId, token }) {
+  // Use /content to stream bytes
+  const res = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`download failed: ${res.status} ${txt}`);
+  }
+  const arr = await res.arrayBuffer();
+  return Buffer.from(arr);
+}
+
+// -----------------------------
+// XLSX: extract preview links
+// -----------------------------
 export function extractPreviewLinksFromXlsx(buffer) {
   const wb = XLSX.read(buffer, { type: 'buffer' });
+
+  // Find "Preview Links" sheet (case-insensitive, trimmed)
+  const sheetName =
+    (wb.SheetNames || []).find(
+      (n) => normalize(n) === normalize('Preview Links')
+    ) || wb.SheetNames?.[0];
+
+  if (!sheetName) return [];
+
+  const ws = wb.Sheets[sheetName];
+  const json = XLSX.utils.sheet_to_json(ws, { header: 1, blankrows: false });
+
+  // Regex you already use in CONFIG
+  const urlRe = /\bhttps?:\/\/[^\s)]+?(?:convert_action=convert_vpreview|convert_e=\d{6,}|convert_v=\d{6,})[^\s)]*/gi;
+
   const links = new Set();
 
-  // keep the same pattern as in post-qa.js
-  const RE = /\bhttps?:\/\/[^\s)]+?(?:convert_action=convert_vpreview|convert_e=\d{6,}|convert_v=\d{6,})[^\s)]*/gi;
-
-  for (const sheetName of wb.SheetNames) {
-    const ws = wb.Sheets[sheetName];
-    const csv = XLSX.utils.sheet_to_csv(ws, { FS: '\t' });
-    (csv.match(RE) || []).forEach((u) => links.add(u.trim()));
+  for (const row of json) {
+    for (const cell of row) {
+      const txt = String(cell ?? '');
+      const matches = txt.match(urlRe);
+      if (matches) {
+        matches.forEach((m) => links.add(m.trim()));
+      }
+    }
   }
-  return [...links];
+
+  return Array.from(links);
 }

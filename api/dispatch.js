@@ -1,83 +1,87 @@
-/**
- * api/dispatch.js
- * ---------------------------------------------------------------------------
- * Vercel Serverless Function: ClickUp Button → GitHub workflow_dispatch
- *
- * ClickUp Automation (Call webhook) URL example:
- *   https://<your-app>.vercel.app/api/dispatch?task_id={{task.id}}&token=<SHARED_DISPATCH_TOKEN>
- *
- * Vercel Project → Settings → Environment Variables (add and redeploy):
- *   GH_REPO               e.g. "your-org/your-repo"
- *   GH_WORKFLOW           e.g. "post-qa.yml"  (the workflow file name)
- *   GH_REF                e.g. "main"
- *   GH_TOKEN              GitHub PAT with repo + actions:write
- *   SHARED_DISPATCH_TOKEN long random string (same one you put in the ClickUp webhook URL)
- */
+// api/dispatch.js
+// Accepts GET or POST from ClickUp. Auth via shared token.
+// Dispatches a GitHub workflow with the ClickUp task id as input.
 
 export default async function handler(req, res) {
   try {
-    const {
-      GH_REPO,
-      GH_WORKFLOW,
-      GH_REF = 'main',
-      GH_TOKEN,
-      SHARED_DISPATCH_TOKEN,
-    } = process.env;
-
-    if (!GH_REPO || !GH_WORKFLOW || !GH_TOKEN || !SHARED_DISPATCH_TOKEN) {
-      return res.status(500).json({ error: 'Missing required env vars' });
-    }
-
-    // Accept GET or POST
-    const isJson = (req.headers['content-type'] || '').includes('application/json');
-    const body = isJson ? await readJson(req) : {};
+    // --- Read inputs (supports GET query or POST JSON) ---
+    const method = req.method || 'GET';
     const q = req.query || {};
+    const body = typeof req.body === 'object' ? req.body : {};
 
-    // Shared secret check (query, body, or X-Auth header)
-    const providedToken = q.token || body.token || req.headers['x-auth'] || '';
-    if (providedToken !== SHARED_DISPATCH_TOKEN) {
-      return res.status(401).json({ error: 'Unauthorized' });
+    const taskId = (q.task_id || body.task_id || q.task || body.task || '').toString().trim();
+    const tokenQP = (q.token || '').toString().trim();
+    const tokenHdr = (req.headers['x-auth'] || req.headers['X-Auth'] || '').toString().trim();
+
+    // --- Auth check against shared token ---
+    const expected = (process.env.SHARED_DISPATCH_TOKEN || '').toString().trim();
+    const authOk = !!expected && (tokenQP === expected || tokenHdr === expected);
+
+    console.log('[Dispatch] Incoming', {
+      method,
+      hasTaskId: !!taskId,
+      hasQueryToken: !!tokenQP,
+      hasHeaderToken: !!tokenHdr,
+      expectedSet: !!expected,
+      authOk,
+    });
+
+    if (!authOk) {
+      return res.status(401).json({ error: 'Unauthorized (bad or missing token)' });
+    }
+    if (!taskId) {
+      return res.status(400).json({ error: 'Missing task_id' });
     }
 
-    // Task id from query/body
-    const taskId = (q.task_id || body.task_id || '').trim();
-    if (!taskId) return res.status(400).json({ error: 'Missing task_id' });
+    // --- GitHub envs ---
+    const GH_REPO = (process.env.GH_REPO || '').trim();          // e.g., "lacey-griffith/airdrop"
+    const GH_WORKFLOW = (process.env.GH_WORKFLOW || '').trim();  // e.g., "post-qa.yml" OR numeric ID string
+    const GH_REF = (process.env.GH_REF || 'main').trim();
+    const GH_TOKEN = (process.env.GH_TOKEN || '').trim();
 
-    // GitHub workflow_dispatch
-    const ghUrl = `https://api.github.com/repos/${GH_REPO}/actions/workflows/${GH_WORKFLOW}/dispatches`;
-    const payload = { ref: GH_REF, inputs: { task: taskId } };
+    // Minimal sanity logs (never print secrets)
+    console.log('[Dispatch] Target', {
+      repo: GH_REPO,
+      workflow: GH_WORKFLOW,
+      ref: GH_REF,
+      hasToken: !!GH_TOKEN,
+    });
 
-    const ghRes = await fetch(ghUrl, {
+    if (!GH_REPO || !GH_WORKFLOW || !GH_TOKEN) {
+      return res.status(500).json({ error: 'Server misconfigured (missing GH envs)' });
+    }
+
+    // --- Call GitHub workflow_dispatch ---
+    const url = `https://api.github.com/repos/${GH_REPO}/actions/workflows/${GH_WORKFLOW}/dispatches`;
+
+    const ghRes = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${GH_TOKEN}`,
-        Accept: 'application/vnd.github+json',
-        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${GH_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        ref: GH_REF,
+        inputs: { task: taskId }, // maps to workflow_dispatch.inputs.task
+      }),
     });
 
-    if (!ghRes.ok) {
-      return res.status(502).json({ error: 'GitHub dispatch failed', detail: await safeText(ghRes) });
+    const text = await ghRes.text();
+    console.log('[Dispatch] GitHub response', { status: ghRes.status, text: text?.slice(0, 400) });
+
+    // GitHub returns 204 No Content on success
+    if (ghRes.status === 204) {
+      return res.status(200).json({ ok: true, taskId });
     }
 
-    return res.status(200).json({ ok: true, taskId });
-  } catch (err) {
-    return res.status(500).json({ error: err?.message || 'Server error' });
-  }
-}
-
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', (c) => (data += c));
-    req.on('end', () => {
-      try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); }
+    // Bubble up useful detail
+    return res.status(502).json({
+      error: 'GitHub dispatch failed',
+      status: ghRes.status,
+      detail: text,
     });
-    req.on('error', reject);
-  });
-}
-
-async function safeText(res) {
-  try { return await res.text(); } catch { return '<no body>'; }
+  } catch (err) {
+    console.error('[Dispatch] Error', err?.message || err);
+    return res.status(500).json({ error: 'Internal error' });
+  }
 }

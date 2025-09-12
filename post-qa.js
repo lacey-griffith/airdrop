@@ -87,11 +87,14 @@ import FormData from "form-data";
 import {
   getGraphToken,
   listFolderItems,
+  listFolderChildren,
   downloadItemBuffer,
+  findTaskSubfolder,
   findExcelForTask,
   getImageFiles,
   extractPreviewLinksFromXlsx,
-} from "./sharepoint.js";
+} from './sharepoint.js';
+
 
 // -------------------------
 // Small utils
@@ -383,14 +386,22 @@ const TASK_ID = parseTaskId(INPUT);
 
     if (graphToken) {
       try {
-        const items = await listFolderItems({ folderUrl: qaFolderUrl, token: graphToken });
-        log("[AirDrop] Folder items:", Array.isArray(items) ? items.length : "(none)");
-        if (Array.isArray(items) && items.length) {
-          log("[AirDrop] First few item names:", items.slice(0, 5).map((i) => i.name));
+        // Root children
+        const rootItems = await listFolderItems({ folderUrl: qaFolderUrl, token: graphToken });
+
+        // If a child folder matches the task name, drill in one level
+        let items = rootItems;
+        const taskFolder = findTaskSubfolder(rootItems, taskName);
+        if (taskFolder) {
+          log(`[SP] Drilling into task subfolder: ${taskFolder.name}`);
+          items = await listFolderChildren({ driveId: taskFolder.driveId, itemId: taskFolder.id, token: graphToken });
+        } else {
+          log('[SP] No matching task subfolder found; using root folder');
         }
 
         // 3a) Excel selection (based on task title), then extract links
         const excelItem = findExcelForTask(items, taskName);
+
         if (excelItem) {
           log("[AirDrop] Excel chosen:", { name: excelItem.name, id: excelItem.id });
           const buf = await downloadItemBuffer({

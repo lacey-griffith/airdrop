@@ -4,44 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       task:
-        description: "ClickUp task URL or ID (e.g., https://app.clickup.com/t/abc123 or abc123)"
+        description: ClickUp Task ID or URL
         required: true
         type: string
-run-name: AirDrop — ${{ inputs.task }}
-
-# Prevent duplicate runs for the same task if someone clicks twice
-concurrency:
-  group: airdrop-${{ github.workflow }}-${{ inputs.task }}
-  cancel-in-progress: false
-
-# This workflow only needs read access to the repo contents
-permissions:
-  contents: read
+run-name: AirDrop — ${{ inputs.task }},
 
 jobs:
   run:
-    name: Post QA comment
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
+    runs-on: ubuntu-latest,
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Use Node.js 20
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - name: Install deps
+        run: npm ci || npm install
       - name: Run AirDrop script
-        run: node post-qa.js "${{ inputs.task }}"
-        env: 
+        env:
           CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
-    
-        #   MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
-        #   MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
-        #   MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+          MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
+          MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
+          MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
+        run: node post-qa.js "${{ inputs.task }}"
