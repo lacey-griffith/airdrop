@@ -40,7 +40,8 @@ jobs:
       - name: Run AirDrop script
         run: node post-qa.js "${{ inputs.task }}"
         env: 
-            CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+    
         #   MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
         #   MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
         #   MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
