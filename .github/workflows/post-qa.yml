@@ -7,6 +7,7 @@ on:
         description: "ClickUp task URL or ID (e.g., https://app.clickup.com/t/abc123 or abc123)"
         required: true
         type: string
+run-name: AirDrop — ${{ inputs.task }}
 
 # Prevent duplicate runs for the same task if someone clicks twice
 concurrency:
@@ -38,8 +39,8 @@ jobs:
 
       - name: Run AirDrop script
         run: node post-qa.js "${{ inputs.task }}"
-        env:
-          CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
+        env: 
+            CLICKUP_TOKEN: ${{ secrets.CLICKUP_TOKEN }}
         #   MS_TENANT_ID: ${{ secrets.MS_TENANT_ID }}
         #   MS_CLIENT_ID: ${{ secrets.MS_CLIENT_ID }}
         #   MS_CLIENT_SECRET: ${{ secrets.MS_CLIENT_SECRET }}
