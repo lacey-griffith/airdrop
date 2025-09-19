@@ -1,5 +1,5 @@
 // api/dispatch.js
-// Accepts GET or POST from ClickUp. Auth via shared token.
+// Accepts GET or POST from ClickUp. Auth via shared token (query, X-Auth, or Authorization: Bearer).
 // Dispatches a GitHub workflow with the ClickUp task id as input.
 
 export default async function handler(req, res) {
@@ -10,18 +10,26 @@ export default async function handler(req, res) {
     const body = typeof req.body === 'object' ? req.body : {};
 
     const taskId = (q.task_id || body.task_id || q.task || body.task || '').toString().trim();
-    const tokenQP = (q.token || '').toString().trim();
+
+    // Tokens from: query param, X-Auth header, or Authorization: Bearer
+    const tokenQP  = (q.token || '').toString().trim();
     const tokenHdr = (req.headers['x-auth'] || req.headers['X-Auth'] || '').toString().trim();
+
+    const authHdr = (req.headers['authorization'] || req.headers['Authorization'] || '').toString().trim();
+    const bearer  = authHdr.toLowerCase().startsWith('bearer ')
+      ? authHdr.slice(7).trim()
+      : '';
 
     // --- Auth check against shared token ---
     const expected = (process.env.SHARED_DISPATCH_TOKEN || '').toString().trim();
-    const authOk = !!expected && (tokenQP === expected || tokenHdr === expected);
+    const authOk = !!expected && (tokenQP === expected || tokenHdr === expected || bearer === expected);
 
     console.log('[Dispatch] Incoming', {
       method,
       hasTaskId: !!taskId,
       hasQueryToken: !!tokenQP,
       hasHeaderToken: !!tokenHdr,
+      hasAuthBearer: !!bearer,
       expectedSet: !!expected,
       authOk,
     });
@@ -34,12 +42,11 @@ export default async function handler(req, res) {
     }
 
     // --- GitHub envs ---
-    const GH_REPO = (process.env.GH_REPO || '').trim();          // e.g., "lacey-griffith/airdrop"
-    const GH_WORKFLOW = (process.env.GH_WORKFLOW || '').trim();  // e.g., "post-qa.yml" OR numeric ID string
-    const GH_REF = (process.env.GH_REF || 'main').trim();
-    const GH_TOKEN = (process.env.GH_TOKEN || '').trim();
+    const GH_REPO     = (process.env.GH_REPO || '').trim();          // e.g., "lacey-griffith/airdrop"
+    const GH_WORKFLOW = (process.env.GH_WORKFLOW || '').trim();      // e.g., "post-qa.yml" OR numeric ID string
+    const GH_REF      = (process.env.GH_REF || 'main').trim();
+    const GH_TOKEN    = (process.env.GH_TOKEN || '').trim();
 
-    // Minimal sanity logs (never print secrets)
     console.log('[Dispatch] Target', {
       repo: GH_REPO,
       workflow: GH_WORKFLOW,
@@ -69,12 +76,9 @@ export default async function handler(req, res) {
     const text = await ghRes.text();
     console.log('[Dispatch] GitHub response', { status: ghRes.status, text: text?.slice(0, 400) });
 
-    // GitHub returns 204 No Content on success
     if (ghRes.status === 204) {
       return res.status(200).json({ ok: true, taskId });
     }
-
-    // Bubble up useful detail
     return res.status(502).json({
       error: 'GitHub dispatch failed',
       status: ghRes.status,
